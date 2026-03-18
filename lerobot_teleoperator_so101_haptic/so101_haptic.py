@@ -2,7 +2,6 @@ import numpy as np
 import threading
 import time
 from typing import Any
-from dataclasses import dataclass, field
 import scipy.spatial.transform as st  # Added for quaternion math
 
 from lerobot.teleoperators.teleoperator import Teleoperator
@@ -10,50 +9,16 @@ from .config_so101_haptic_teleop import So101HapticTeleopConfig
 
 import pyroki as pk
 from robot_descriptions.loaders.yourdfpy import load_robot_description
-from .pyroki_snippets import solve_ik
+
+from .haptics.get_position import haptic_state, haptic_callback
+from .haptics.ik_feedback import calculate_ik_feedback
+from .haptics.pyroki_snippets import solve_ik
 
 from pyOpenHaptics.hd_device import HapticDevice
-import pyOpenHaptics.hd as hd
-from pyOpenHaptics.hd_callback import hd_callback
 
-# ---------------------------------------------------------------------------
-# Haptic Device State & Callback
-# ---------------------------------------------------------------------------
-@dataclass
-class HapticState:
-    """Stores the latest state from the haptic device."""
-    position: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
-    velocity: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
-    rot_matrix: np.ndarray = field(default_factory=lambda: np.eye(3)) # Added rotation
-    button: bool = False
-    force: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
+import viser
+from viser.extras import ViserUrdf
 
-haptic_state = HapticState()
-
-@hd_callback
-def haptic_callback():
-    """High-frequency callback executed by the HDAPI."""
-    global haptic_state
-    transform = hd.get_transform()
-    velocity = hd.get_velocity()
-    button = hd.get_buttons()
-    
-    # Extract translation (Position)
-    haptic_state.position = [transform[3][0], transform[3][1], transform[3][2]]
-    haptic_state.velocity = [velocity[0], velocity[1], velocity[2]]
-    
-    # Extract 3x3 Rotation Matrix from the 4x4 transform (column-major)
-    rot = np.array([
-        [transform[0][0], transform[1][0], transform[2][0]],
-        [transform[0][1], transform[1][1], transform[2][1]],
-        [transform[0][2], transform[1][2], transform[2][2]]
-    ])
-    haptic_state.rot_matrix = rot
-
-    # Map the primary stylus button to True/False
-    haptic_state.button = True if button == 1 else False
-
-    hd.set_force(haptic_state.force)  # Apply any forces set by the main thread
 # ---------------------------------------------------------------------------
 # Teleoperator Class
 # ---------------------------------------------------------------------------
@@ -72,12 +37,15 @@ class So101HapticTeleop(Teleoperator):
         
         self._latest_q_sol = None
         self._latest_gripper = 0.0
+        self._last_crash_print = 0.0
+        self._last_lift_print = 0.0
+        self._lift_active = False
 
         self.scale = 50.0 
         self.workspace_scale = 0.001 
         self.workspace_offset = np.array([0.0093, -0.2703, 0.15]) 
         
-        self._filtered_force = np.array([0.0, 0.0, 0.0])
+        self._filtered_torques = np.zeros(6)
         
         
         # Fixed orientation for IK (matching your original UI's wxyz)
@@ -92,6 +60,7 @@ class So101HapticTeleop(Teleoperator):
             "1": "shoulder_pan", "2": "shoulder_lift", "3": "elbow_flex",
             "4": "wrist_flex", "5": "wrist_roll"
         }
+        self._mujoco_robot_ref = None
 
     def _ik_worker(self):
         """Background thread that continuously solves IK based on the haptic position."""
@@ -130,7 +99,7 @@ class So101HapticTeleop(Teleoperator):
             # Set your multipliers here! 
             # 1.0 is 1:1 mapping. 2.0 means moving the stylus 10 degrees moves the robot 20 degrees.
             roll_gain = 1.8 
-            pitch_gain = 1.0
+            pitch_gain = 0.0
             yaw_gain = 1.0 
             
             euler_angles[0] *= roll_gain
@@ -155,11 +124,54 @@ class So101HapticTeleop(Teleoperator):
                 target_wxyz=target_quat,
             )
 
+            # Update UI target
+            if getattr(self, 'ik_web_target', None) is not None:
+                self.ik_web_target.position = target_pos
+                self.ik_web_target.wxyz = target_quat
+
             if q_sol is not None:
                 gripper_val = 1.0 if button_pressed else 0.0
+                
+                # Update UI Ghost
+                if getattr(self, 'urdf_vis', None) is not None:
+                    q_vis = np.array(q_sol)
+                    if "6" in self.urdf_joints:
+                        gripper_idx = self.urdf_joints.index("6")
+                        q_vis[gripper_idx] = gripper_val
+                    self.urdf_vis.update_cfg(q_vis)
+
                 with self._lock:
+                    self._latest_target_pos = target_pos
                     self._latest_q_sol = q_sol
                     self._latest_gripper = gripper_val
+                    
+                # --- IK FEEDBACK USING ACTUAL ROBOT OBSERVATION ---
+                # Retrieve the global So101MujocoRobot instance safely to 
+                # bypass `send_feedback` and be standard-command compatible.
+                if self._mujoco_robot_ref is None:
+                    import gc
+                    for obj in gc.get_objects():
+                        if type(obj).__name__ == "So101MujocoRobot":
+                            self._mujoco_robot_ref = obj
+                            break
+                            
+                if self._mujoco_robot_ref is not None and hasattr(self._mujoco_robot_ref, "_latest_obs"):
+                    obs = self._mujoco_robot_ref._latest_obs
+                    actual_q = np.zeros(len(self.urdf_joints))
+                    for i, j_name in enumerate(self.urdf_joints):
+                        if j_name in self.ik_joint_mapping:
+                            joint_key = f"{self.ik_joint_mapping[j_name]}.pos"
+                            actual_q[i] = obs.get(joint_key, 0.0)
+                        elif j_name == "6":
+                            actual_q[i] = obs.get("gripper.pos", 0.0)
+                            
+                    force = calculate_ik_feedback(
+                        robot=self.robot,
+                        q_actual=actual_q,
+                        expected_target_pos=target_pos,
+                        target_link_name=self.config.target_link
+                    )
+                    haptic_state.force = force
 
             time.sleep(0.01)
 
@@ -167,6 +179,23 @@ class So101HapticTeleop(Teleoperator):
         self.urdf = load_robot_description(self.config.urdf_name)
         self.robot = pk.Robot.from_urdf(self.urdf)
         self.urdf_joints = [j.name for j in self.urdf.actuated_joints]
+        
+        if getattr(self.config, "enable_viser", True):
+            self.viser_server = viser.ViserServer(port=self.config.viser_port)
+            self.viser_server.scene.add_grid("/ground", width=2, height=2)
+            self.urdf_vis = ViserUrdf(self.viser_server, self.urdf, root_node_name="/ghost_robot")
+            
+            # Add visualizer target
+            self.ik_web_target = self.viser_server.scene.add_transform_controls(
+                "/ik_target", 
+                scale=0.1, 
+                position=(0.00931305, -0.27034248, 0.26730747), 
+                wxyz=(0.707, -0.707, 0.0, 0.0)
+            )
+        else:
+            self.viser_server = None
+            self.ik_web_target = None
+            self.urdf_vis = None
         
         print("\n--- Connecting to Haptic Device ---")
         self.haptic_device = HapticDevice(
@@ -193,6 +222,8 @@ class So101HapticTeleop(Teleoperator):
 
     def disconnect(self) -> None:
         self._is_connected = False
+        if hasattr(self, 'viser_server') and self.viser_server:
+            self.viser_server.stop()
         if self._ik_thread:
             self._ik_thread.join(timeout=1.0)
             
@@ -215,16 +246,22 @@ class So101HapticTeleop(Teleoperator):
         }
 
         if q_sol is not None:
-            if "1" in self.urdf_joints: action_dict["shoulder_pan.pos"] = float(q_sol[self.urdf_joints.index("1")]) * self.scale
-            if "2" in self.urdf_joints: action_dict["shoulder_lift.pos"] = float(q_sol[self.urdf_joints.index("2")]) * self.scale
-            if "3" in self.urdf_joints: action_dict["elbow_flex.pos"] = float(q_sol[self.urdf_joints.index("3")])  * self.scale
-            if "4" in self.urdf_joints: action_dict["wrist_flex.pos"] = float(q_sol[self.urdf_joints.index("4")]) * self.scale
-            if "5" in self.urdf_joints: action_dict["wrist_roll.pos"] = float(q_sol[self.urdf_joints.index("5")]) * self.scale
+            if "1" in self.urdf_joints:
+                action_dict["shoulder_pan.pos"] = float(q_sol[self.urdf_joints.index("1")]) * self.scale
+            if "2" in self.urdf_joints:
+                action_dict["shoulder_lift.pos"] = float(q_sol[self.urdf_joints.index("2")]) * self.scale
+            if "3" in self.urdf_joints:
+                action_dict["elbow_flex.pos"] = float(q_sol[self.urdf_joints.index("3")]) * self.scale
+            if "4" in self.urdf_joints:
+                action_dict["wrist_flex.pos"] = float(q_sol[self.urdf_joints.index("4")]) * self.scale
+            if "5" in self.urdf_joints:
+                action_dict["wrist_roll.pos"] = float(q_sol[self.urdf_joints.index("5")]) * self.scale
             
         return action_dict
     
     @property
     def action_features(self) -> dict:
+        # Register the features with the exact .pos suffix the pipeline expects
         return {
             "shoulder_pan.pos": float, "shoulder_lift.pos": float, "elbow_flex.pos": float,
             "wrist_flex.pos": float, "wrist_roll.pos": float, "gripper.pos": float,
@@ -232,7 +269,7 @@ class So101HapticTeleop(Teleoperator):
 
     @property
     def feedback_features(self) -> dict:
-        return {"motor_force": (3,)}
+        return {}
 
     @property
     def is_calibrated(self) -> bool:
@@ -244,49 +281,5 @@ class So101HapticTeleop(Teleoperator):
     def configure(self) -> None:
         pass
 
-    def send_feedback(self, feedback: dict[str, Any]) -> None:# Check the config parameter
-        global haptic_state
-        if not self.config.use_haptics:
-            # Send zero force to ensure motors are 'off'
-            haptic_state.force = [0.0, 0.0, 0.0]
-            return
-        
-        
-        if "motor_force" not in feedback:
-            return
-            
-        raw_force = np.array(feedback["motor_force"])
-        
-        # --- 1. LOW-PASS FILTER (Smooths out violent spikes) ---
-        alpha = 0.15 # 0.0 is entirely smooth/unresponsive, 1.0 is raw noise. 
-        self._filtered_force = (alpha * raw_force) + ((1.0 - alpha) * self._filtered_force)
-        
-        # --- 2. SCALE ---
-        force_scale = 0.03 # Keep it low while testing
-        scaled_force = self._filtered_force * force_scale
-        
-        # Map Robot frame to Haptic frame
-        # Robot X = Haptic X | Robot Y = -Haptic Z | Robot Z = Haptic Y
-        mapped_force = np.array([
-            float(scaled_force[0]),
-            float(scaled_force[2]),
-            float(-scaled_force[1])
-        ])
-
-        # --- 3. VIRTUAL DAMPING (Kills the shaking) ---
-        haptic_vel = np.array(haptic_state.velocity)
-        
-        # Damping coefficient. It pushes opposite to your movement.
-        damping_b = 0.002 
-        damping_force = -damping_b * haptic_vel
-        
-        # Combine the forces!
-        final_force = mapped_force + damping_force
-        
-        # --- 4. CLAMP FOR SAFETY ---
-        max_haptic_force = 3.3 
-        force_mag = np.linalg.norm(final_force)
-        if force_mag > max_haptic_force:
-            final_force = (final_force / force_mag) * max_haptic_force
-            
-        haptic_state.force = final_force.tolist()
+    def send_feedback(self, feedback: dict[str, Any]) -> None:
+        pass
